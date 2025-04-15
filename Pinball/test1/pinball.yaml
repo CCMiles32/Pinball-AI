@@ -1,0 +1,6 @@
+path: /home/miles/Documents/School/RobotLearning/Pinball/dataset
+train: images/train
+val: images/val
+
+names:
+  0: pinball
