@@ -1,9 +1,17 @@
 import cv2
 
-input_video = "../data/pinball-video-shortened-30fps.mp4"
+input_video = "../data/kevins-pinball-2.mp4"
 #input_video = "../data/kevins-pinball.mp4"
 
 # video Inference
+
+# Function to calculate contour circularity
+def contour_circularity(cnt):
+    perimeter = cv2.arcLength(cnt, True)
+    area = cv2.contourArea(cnt)
+    if perimeter == 0:
+        return 0
+    return 4 * np.pi * (area / (perimeter ** 2))
 
 
 def vid_inf(vid_path):
@@ -21,7 +29,7 @@ def vid_inf(vid_path):
     #out = cv2.VideoWriter(output_video, fourcc, fps, frame_size)
 
     # Create Background Subtractor MOG2 object
-    backSub = cv2.createBackgroundSubtractorMOG2()
+    backSub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
 
     # Check if camera opened successfully
     if not cap.isOpened():
