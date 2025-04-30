@@ -1,0 +1,23 @@
+name: pinball
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pytorch
+  - torchvision
+  - cudatoolkit=11.8  # Keep if GPU-enabled
+  - opencv
+  - matplotlib
+  - swig
+  - pygame
+  - pip
+
+  - pip:
+      - gymnasium[atari,all]
+      - box2d-py
+      - box2d-kengz
+      - ale-py
+      - autorom
+      - autorom-accept-rom-license
