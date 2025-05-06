@@ -5,271 +5,305 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-import random # Import random for epsilon-greedy
+import random
 import time
-
+import logging
+import datetime
+import os
+from collections import deque # Import deque
+import math
 
 # --- Import necessary components ---
-from config import * # Import all config variables
-from dqn_model import DQN # Assumes DQN model is updated for image and ball state
+from config import * 
+from dqn_model import DQN 
 from utils import ReplayMemory
 from preprocessing import preprocess_frame
-from ball_tracker import detect_ball # Import ball detection function
+from ball_tracker import detect_ball
 
-# --- Define choose_action logic here or import if kept separate ---
-# It's often simpler to have it directly in the training loop if it depends
-# closely on the model and state representation used here.
-def choose_action(model, state_image, state_ball, epsilon, device):
-    """
-    Selects an action using epsilon-greedy strategy.
-    Assumes model takes both image and ball state tensors.
-    """
+# --- Constants ---
+EPISODES_BETWEEN_DEEP_LOG = 100
+EPISODE_SAVE_FREQUENCY = 100 # Frequency to save based on episodes
+STEP_SAVE_FREQUENCY = 100000 # Frequency to save based on total steps
+TREND_WINDOW_SIZE = 100
+FLAT_THRESHOLD = 1e-5
+
+# --- Configure Logging ---
+log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
+now = datetime.datetime.now(); timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+log_filename_only = f"training_log_{timestamp_str}.log"
+log_file_full_path = os.path.join(log_dir, log_filename_only)
+logging.basicConfig(filename=log_file_full_path, level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s', filemode='w')
+# Set INFO for file, but allow DEBUG level messages potentially for life loss detection
+logger = logging.getLogger(__name__); logger.setLevel(logging.DEBUG) # Changed to DEBUG to allow life loss logs
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO); formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+# Ensure handlers are not added multiple times if script is re-run in interactive session
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    logger.addHandler(console_handler)
+# Clear existing file handlers if any, to avoid writing to old files on re-runs
+logger.handlers = [h for h in logger.handlers if not isinstance(h, logging.FileHandler)]
+file_handler = logging.FileHandler(log_file_full_path, mode='w')
+file_handler.setLevel(logging.INFO) # Keep file log at INFO level
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+print(f"Logging to file: {log_file_full_path}") # Keep this print statement
+
+# --- Helper function to stack frames from buffer ---
+def get_stacked_frames_tensor(state_buffer):
+    """Converts a deque of frames (numpy arrays) into a stacked tensor."""
+    stacked_frames_np = np.stack(list(state_buffer), axis=0) # Shape: (NUM_FRAMES_STACKED, H, W)
+    state_tensor = torch.tensor(stacked_frames_np, dtype=torch.float32).unsqueeze(0) # Shape: (1, NUM_FRAMES_STACKED, H, W)
+    return state_tensor
+
+# --- choose_action function (takes stacked_state_tensor) ---
+def choose_action(model, stacked_state_tensor, state_ball, epsilon, device):
     if random.random() < epsilon:
-        # Return a random action INDEX (0 to NUM_AGENT_ACTIONS-1)
         return random.randint(0, NUM_AGENT_ACTIONS - 1)
     else:
         with torch.no_grad():
-            # Ensure tensors are on the correct device
-            state_image = state_image.to(device)
+            stacked_state_tensor = stacked_state_tensor.to(device)
             state_ball = state_ball.to(device)
-            # Get Q-values from the model (which now takes both inputs)
-            q_values = model(state_image, state_ball)
-        # Return the index of the best action
+            q_values = model(stacked_state_tensor, state_ball) # Model forward pass uses stacked frames
         return torch.argmax(q_values).item()
 
-# --- Updated optimize_model function ---
+# --- optimize_model function (Receives stacked tensors via batch) ---
 def optimize_model(model, target_model, optimizer, batch, device):
-    """
-    Optimizes the DQN model using a batch of experiences.
-    Handles both image and ball state tensors.
-    """
-    # Unpack the batch correctly including ball states
-    # Expected order: (state_img, state_ball, action_idx, reward, next_state_img, next_state_ball, done)
-    state_images, state_balls, actions, rewards, next_state_images, next_state_balls, dones = zip(*batch)
-
-    # Concatenate tensors correctly and send to device
-    state_images = torch.cat(state_images).to(device)
-    state_balls = torch.cat(state_balls).to(device) # Handle ball state
-    next_state_images = torch.cat(next_state_images).to(device)
-    next_state_balls = torch.cat(next_state_balls).to(device) # Handle next ball state
-
-    # Convert actions, rewards, dones to tensors
-    # Actions are indices (long), rewards/dones are floats
+    stacked_states, state_balls, actions, rewards, next_stacked_states, next_state_balls, dones = zip(*batch)
+    stacked_states = torch.cat(stacked_states).to(device)
+    next_stacked_states = torch.cat(next_stacked_states).to(device)
+    state_balls = torch.cat(state_balls).to(device)
+    next_state_balls = torch.cat(next_state_balls).to(device)
     actions = torch.tensor(actions, dtype=torch.long, device=device).unsqueeze(1)
     rewards = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(1)
-    dones = torch.tensor(dones, dtype=torch.float32, device=device).unsqueeze(1) # Use 0.0 and 1.0
-
-    # --- Q-Value Calculation (using the updated model forward pass) ---
-    q_values = model(state_images, state_balls).gather(1, actions)
-
-    # --- Target Q-Value Calculation (using the updated target model forward pass) ---
+    dones = torch.tensor(dones, dtype=torch.float32, device=device).unsqueeze(1)
+    q_values = model(stacked_states, state_balls).gather(1, actions)
     with torch.no_grad():
-        # Get Q-values for the next states from the target network
-        next_q_values_target = target_model(next_state_images, next_state_balls)
-        # Select the best Q-value for the next state (Double DQN could use policy model here)
+        next_q_values_target = target_model(next_stacked_states, next_state_balls)
         best_next_q_values = next_q_values_target.max(1)[0].unsqueeze(1)
-
-    # --- Expected Q-Value Calculation (Bellman Equation) ---
-    # If done is 1.0, the future reward component is zero
     expected_q_values = rewards + (GAMMA * best_next_q_values * (1.0 - dones))
-
-    # --- Loss Calculation ---
-    # Using Smooth L1 Loss (Huber Loss) is common in DQN
     loss = F.smooth_l1_loss(q_values, expected_q_values)
-
-    # --- Optimization ---
-    optimizer.zero_grad()
-    loss.backward()
-    # Optional: Gradient clipping (uncomment if needed and GRADIENT_CLIP_VALUE is defined in config)
+    optimizer.zero_grad(); loss.backward()
+    # --- Uncomment the line below to enable gradient clipping ---
     # torch.nn.utils.clip_grad_value_(model.parameters(), GRADIENT_CLIP_VALUE)
     optimizer.step()
+    return loss.item()
 
+# --- Helper function for saving model state ---
+def save_model_state(model, save_path, step_or_episode_info):
+    """Saves the model state_dict with logging and error handling."""
+    try:
+        torch.save(model.state_dict(), save_path)
+        logger.info(f"Model state dictionary saved ({step_or_episode_info}) to {save_path}")
+    except Exception as e:
+        logger.error(f"Error saving model ({step_or_episode_info}) to {save_path}: {e}")
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
+    logger.info(f"Using NUM_FRAMES_STACKED = {NUM_FRAMES_STACKED}")
 
-    # Use the correct environment ID and render mode
-    # render_mode="human" for visualization, "rgb_array" for faster training
-    env = gym.make("ALE/VideoPinball-v5", render_mode="rgb_array") 
+    # --- Create Timestamped Weights Directory for this Run (inside base 'weights' folder) ---
+    base_weights_dir = "weights"
+    os.makedirs(base_weights_dir, exist_ok=True) # Ensure base 'weights' folder exists
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Create path like weights/weights_YYYYMMDD_HHMMSS
+    run_weights_dir = os.path.join(base_weights_dir, f"weights_{run_timestamp}")
+    os.makedirs(run_weights_dir, exist_ok=True) # Create the specific run's weights folder
+    logger.info(f"Saving weights for this run to: {run_weights_dir}")
+    # ---
+
+    # Ensure LIFE_LOST_PENALTY is accessible, provide default if not in config
+    life_lost_penalty_value = LIFE_LOST_PENALTY
+    logger.info(f"Using LIFE_LOST_PENALTY = {life_lost_penalty_value}")
+    # Also log action costs being used
+    logger.info(f"Action Costs: LEFT={LEFT_FLIPPER_COST}, RIGHT={RIGHT_FLIPPER_COST}, BOTH={BOTH_FLIPPERS_COST}, DOWN={DOWN_COST}, NO_FLIPPER={NO_FLIPPER_COST}, FIRE={FIRE_COST}")
+
+
+    env = gym.make("ALE/VideoPinball-v5", render_mode="rgb_array")
 
     try:
-        frame_height = env.observation_space.shape[0]
-        frame_width = env.observation_space.shape[1]
-        print(f"Detected Frame Dimensions: {frame_width}x{frame_height}")
+        frame_height = env.observation_space.shape[0]; frame_width = env.observation_space.shape[1]
+        logger.info(f"Detected Frame Dimensions: {frame_width}x{frame_height}")
     except Exception as e:
-        print(f"Warning: Could not automatically get frame dimensions: {e}. Using defaults (e.g., 210x160)")
-        # Fallback to default dimensions if detection fails
-        frame_height = 210
-        frame_width = 160
+        logger.warning(f"Could not automatically get frame dimensions: {e}. Using defaults (e.g., 210x160)")
+        frame_height = 210; frame_width = 160
 
-    # Agent's action space size
     num_actions = NUM_AGENT_ACTIONS
-    print(f"Agent's Learned Action Space Size: {num_actions}")
-    print(f"Action Map (Agent Index -> Env Action): {ACTION_MAP}")
+    logger.info(f"Agent's Learned Action Space Size: {num_actions}")
+    logger.info(f"Action Map (Agent Index -> Env Action): {ACTION_MAP}")
 
-    # Initialize models
     model = DQN(num_actions).to(device)
     target_model = DQN(num_actions).to(device)
-    target_model.load_state_dict(model.state_dict())
-    target_model.eval() # Target model is only for inference
+    target_model.load_state_dict(model.state_dict()); target_model.eval()
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     memory = ReplayMemory(MEMORY_SIZE)
 
     epsilon = EPSILON_START
     total_steps = 0
+    last_step_save = 0 # Keep track of last step saved to avoid double saving if episode ends exactly on step boundary
 
-    print("Starting training...")
+    logger.info("Starting training...")
     for episode in range(1, NUM_EPISODES + 1):
-        total_reward = 0
+        total_reward_episode = 0.0; current_loss = 0.0; num_optim_steps = 0
         done = False
-        observation, info = env.reset() # Get initial observation (raw frame)
+
+        # --- Reset environment and get initial lives ---
+        observation, info = env.reset()
+        current_lives = info.get("lives", 0) # Get initial lives count
+        #logger.debug(f"Episode {episode} Start: Initial Lives = {current_lives}")
+ 
+
+        processed_frame = preprocess_frame(observation)
+        state_frame_buffer = deque([processed_frame] * NUM_FRAMES_STACKED, maxlen=NUM_FRAMES_STACKED)
+        current_stacked_state_tensor = get_stacked_frames_tensor(state_frame_buffer)
+
+        ball_pos = detect_ball(observation)
+        if ball_pos: norm_ball_x=min(max(ball_pos[0]/frame_width,0.0),1.0); norm_ball_y=min(max(ball_pos[1]/frame_height,0.0),1.0)
+        else: norm_ball_x = -1.0; norm_ball_y = -1.0
+        current_ball_state_tensor = torch.tensor([[norm_ball_x, norm_ball_y]], dtype=torch.float32)
+
         episode_steps = 0
 
-        
-        # --- Initial State Processing ---
-        # 1. Detect ball in the raw frame
-        ball_pos = detect_ball(observation)
-        
-        # 2. Normalize ball coordinates (0 to 1) and handle None
-        if ball_pos:
-            norm_ball_x = min(max(ball_pos[0] / frame_width, 0.0), 1.0) # Clamp to [0, 1]
-            norm_ball_y = min(max(ball_pos[1] / frame_height, 0.0), 1.0)
-        else:
-            norm_ball_x = -1.0 # Use a distinct value if ball not found
-            norm_ball_y = -1.0
-
-        # Create ball state tensor (add batch dimension)
-        state_ball_tensor = torch.tensor([[norm_ball_x, norm_ball_y]], dtype=torch.float32) # Keep on CPU for memory
-
-        # 3. Preprocess the raw frame for the CNN
-        state_image = preprocess_frame(observation) # Returns (H, W) numpy array
-        # Add batch and channel dimensions for CNN: [1, 1, H, W]
-        state_image_tensor = torch.tensor(state_image, dtype=torch.float32).unsqueeze(0).unsqueeze(0) # Keep on CPU for memory
-
-        print(f"\n--- Episode {episode} Gameplay Start ---") # Mark start of agent control
-
+        if episode % EPISODES_BETWEEN_DEEP_LOG == 0: logger.info(f"--- Episode {episode} Gameplay Start (Detailed Logging Enabled) ---")
 
         while not done:
-            # --- Action Selection ---
-            # Choose action index using epsilon-greedy based on current state tensors
-            # Pass tensors to device within choose_action or before calling
-            action_idx = choose_action(model, state_image_tensor, state_ball_tensor, epsilon, device)
-
-            # Map agent action index to environment action ID
+            action_idx = choose_action(model, current_stacked_state_tensor, current_ball_state_tensor, epsilon, device)
             env_action = ACTION_MAP[action_idx]
-            next_observation, reward, terminated, truncated, info = env.step(env_action)
-            raw_score = info.get("score", None)
-            lives = info.get("lives", None)
-            done = terminated or truncated # Episode ends if terminated or truncated
-            #print(f"  Step {episode_steps}: Epsilon={epsilon:.4f}, Reward={reward:.2f}, Chosen Agent Action Index={AGENT_ACTION_SPACE[action_idx]}, Mapped Env Action={env_action}, ")
-            #print(f"  Step {episode_steps}: Epsilon={epsilon:.4f}, Reward={reward:.2f}, Total Reward: {total_reward:.2f}, Chosen Agent Action Index={AGENT_ACTION_SPACE[action_idx]}, Mapped Env Action={env_action}")
-            print(f"   Step {episode_steps}: Epsilon={epsilon:.4f}, Reward={reward:.2f}, Total Reward: {total_reward:.2f}, Lives: {lives}, Chosen Agent Action Index={AGENT_ACTION_SPACE[action_idx]}")
 
-            # --- Environment Step ---
-            if raw_score is not None:
-                print(f"Game Score at Step {episode_steps}: {raw_score}")
-            # --- Apply Action Cost (Optional) ---
-            if action_idx == 2: # Index for 'LEFT_FLIPPER'
-                FLIPPER_ACTION_COST = LEFT_FLIPPER_COST 
-            elif action_idx == 3: # Index for 'RIGHT_FLIPPER'
-                FLIPPER_ACTION_COST = RIGHT_FLIPPER_COST 
-            elif action_idx == 4: # Index for 'BOTH_FLIPPERS'
-                FLIPPER_ACTION_COST = BOTH_FLIPPERS_COST 
-            elif action_idx == 5: # Index for 'DOWN'
-                FLIPPER_ACTION_COST = DOWN_COST 
-            elif action_idx == 0: # Index for 'NO_ACTION'
-                FLIPPER_ACTION_COST = NO_FLIPPER_COST 
-            elif action_idx == 1: # Index for 'FIRE'
-                FLIPPER_ACTION_COST = NO_FLIPPER_COST 
-            
-            
-            reward += FLIPPER_ACTION_COST # Add penalty
+            next_observation, reward_from_env, terminated, truncated, info = env.step(env_action)
+            done = terminated or truncated # Combined done condition
 
-            # --- Process Next State ---
-            # 1. Detect ball in the *next* raw frame
+            # --- Check for Life Lost and Apply Penalty ---
+            new_lives = info.get("lives", current_lives) # Get lives count after step
+            life_lost_penalty = 0 # Default to no penalty
+            if new_lives < current_lives:
+                life_lost_penalty = life_lost_penalty_value # Apply penalty from config (or default)
+                #logger.debug(f"--- LIFE LOST DETECTED (Step {total_steps})! Prev Lives: {current_lives}, New Lives: {new_lives}. Applying Penalty: {life_lost_penalty} ---")
+            current_lives = new_lives # Update lives count for the next iteration
+          
+
+            # --- Calculate reward: Env Reward + Life Penalty + Action Cost ---
+            current_reward = reward_from_env + life_lost_penalty # Start with env reward + life penalty
+
+            action_name = AGENT_ACTION_SPACE[action_idx] # Get action name for cost lookup and logging
+            action_cost = 0.0 # Default action cost
+            if action_idx == 2: action_cost = LEFT_FLIPPER_COST # Index for LEFT_FLIPPER
+            elif action_idx == 3: action_cost = RIGHT_FLIPPER_COST # Index for RIGHT_FLIPPER
+            elif action_idx == 4: action_cost = BOTH_FLIPPERS_COST # Index for BOTH_FLIPPERS
+            elif action_idx == 5: action_cost = DOWN_COST # Index for DOWN
+            elif action_idx == 0: action_cost = NO_FLIPPER_COST # Index for NO_ACTION
+            elif action_idx == 1: action_cost = FIRE_COST # Index for FIRE
+
+            current_reward += action_cost # Add action cost
+
+
+            # Deep logging moved here to show final calculated reward and penalty effect
+            if episode % EPISODES_BETWEEN_DEEP_LOG == 0:
+                 logger.info(f"   Step {episode_steps}: Epsilon={epsilon:.4f}, EnvReward={reward_from_env:.2f}, LifePenalty={life_lost_penalty}, ActionCost({action_name})={action_cost:.2f}, FinalReward={current_reward:.2f}, Lives: {current_lives}")
+
+
+            next_processed_frame = preprocess_frame(next_observation)
+            state_frame_buffer.append(next_processed_frame)
+            next_stacked_state_tensor = get_stacked_frames_tensor(state_frame_buffer)
+
             next_ball_pos = detect_ball(next_observation)
+            if next_ball_pos: next_norm_ball_x=min(max(next_ball_pos[0]/frame_width,0.0),1.0); next_norm_ball_y=min(max(next_ball_pos[1]/frame_height,0.0),1.0)
+            else: next_norm_ball_x = -1.0; next_norm_ball_y = -1.0
+            next_ball_state_tensor = torch.tensor([[next_norm_ball_x, next_norm_ball_y]], dtype=torch.float32)
 
-            # 2. Normalize next ball coordinates
-            if next_ball_pos:
-                next_norm_ball_x = min(max(next_ball_pos[0] / frame_width, 0.0), 1.0)
-                next_norm_ball_y = min(max(next_ball_pos[1] / frame_height, 0.0), 1.0)
-            else:
-                next_norm_ball_x = -1.0 # Use distinct value
-                next_norm_ball_y = -1.0
+            # Store the final 'current_reward' (including penalties/costs) in memory
+            memory.push((current_stacked_state_tensor, current_ball_state_tensor, action_idx, current_reward,
+                         next_stacked_state_tensor, next_ball_state_tensor, float(done)))
 
-            # Create next ball state tensor
-            next_state_ball_tensor = torch.tensor([[next_norm_ball_x, next_norm_ball_y]], dtype=torch.float32) 
+            current_stacked_state_tensor = next_stacked_state_tensor
+            current_ball_state_tensor = next_ball_state_tensor
+            observation = next_observation # Required for detect_ball in next iteration if needed directly
 
-            # 3. Preprocess the *next* raw frame
-            next_state_image = preprocess_frame(next_observation)
-            # Add batch and channel dimensions
-            next_state_image_tensor = torch.tensor(next_state_image, dtype=torch.float32).unsqueeze(0).unsqueeze(0) 
-
-            # --- Store Transition in Replay Memory ---
-            memory.push((state_image_tensor, state_ball_tensor, # Current state
-                         action_idx, reward,                   # Action index and reward
-                         next_state_image_tensor, next_state_ball_tensor, # Next state
-                         float(done)))                         # Done flag as float (0.0 or 1.0)
-
-            # --- Update State for Next Iteration ---
-            state_image_tensor = next_state_image_tensor
-            state_ball_tensor = next_state_ball_tensor
-            observation = next_observation # Keep raw frame if needed for next ball detection
-
-            total_reward += reward
+            # Log total reward based on the reward the agent optimizes (includes penalties/costs)
+            total_reward_episode += current_reward
             total_steps += 1
             episode_steps += 1
 
-            # --- Optimize Model ---
-            # Start optimizing only when memory has enough samples
-            if len(memory) > BATCH_SIZE:
+            if len(memory) >= BATCH_SIZE:
                 batch = memory.sample(BATCH_SIZE)
-                optimize_model(model, target_model, optimizer, batch, device)
+                loss = optimize_model(model, target_model, optimizer, batch, device)
+                current_loss += loss; num_optim_steps += 1
 
-            # --- Update Target Network ---
-            # Periodically copy weights from policy network to target network
             if total_steps % TARGET_UPDATE_FREQ == 0:
-                 print(f"Updating target network at step {total_steps}")
+                 logger.info(f"Updating target network at total step {total_steps}")
                  target_model.load_state_dict(model.state_dict())
 
-            # --- Epsilon Decay ---
-            # Decay epsilon linearly or exponentially
-            epsilon = max(EPSILON_MIN, epsilon * EPSILON_DECAY) # Exponential decay example
+            # # --- Step-based Model Saving ---
+            # # Check if current step crossed a save frequency boundary
+            # if total_steps // STEP_SAVE_FREQUENCY > last_step_save // STEP_SAVE_FREQUENCY:
+            #      # Ensure we don't re-save if episode ends exactly on boundary and we also save by episode
+            #      if total_steps != last_step_save:
+            #          step_save_path = os.path.join(run_weights_dir, f"pinball_dqn_step_{total_steps}.pth")
+            #          save_model_state(model, step_save_path, f"Step {total_steps}")
+            #          last_step_save = total_steps # Update last saved step
+            # # ---
 
-            # Optional: Render environment for debugging/visualization
-            # env.render() # Uncomment if using render_mode='human' or need explicit render
+            epsilon = max(EPSILON_MIN, epsilon * EPSILON_DECAY)
 
         # --- End of Episode ---
-        print(f"Episode {episode}: Total Reward: {total_reward:.2f}, Epsilon: {epsilon:.4f}, Steps: {episode_steps}, Total Steps: {total_steps}")
+        avg_loss = current_loss / num_optim_steps if num_optim_steps > 0 else 0.0
+        logger.info(f"Episode {episode}: Total Reward: {total_reward_episode:.2f}, Avg Loss: {avg_loss:.4f}, Epsilon: {epsilon:.4f}, Steps: {episode_steps}, Total Steps: {total_steps}")
 
-        # --- Model Saving ---
-        SAVE_FREQUENCY = 100 #Save every 100 episodes
-        if episode % SAVE_FREQUENCY == 0:
-            save_path = f"pinball_dqn_episode_{episode}.pth"
-            try:
-                 torch.save(model.state_dict(), save_path)
-                 print(f"Model state dictionary saved to {save_path}")
-            except Exception as e:
-                 print(f"Error saving model at episode {episode}: {e}")
+        # --- Episode-based Model Saving ---
+        if episode % EPISODE_SAVE_FREQUENCY == 0:
+            episode_save_path = os.path.join(run_weights_dir, f"pinball_dqn_episode_{episode}.pth")
+            save_model_state(model, episode_save_path, f"Episode {episode}")
+            # Update last_step_save to prevent immediate re-saving if step boundary also hit
+            last_step_save = total_steps
+
+        # --- Step-based Model Saving (Alternative Location: After Episode) ---
+        # This ensures saving even if an episode ends exactly on the boundary,
+        # complementing or replacing the episode-based saving.
+        if total_steps // STEP_SAVE_FREQUENCY > last_step_save // STEP_SAVE_FREQUENCY:
+             step_save_path = os.path.join(run_weights_dir, f"pinball_dqn_step_{total_steps}.pth")
+             save_model_state(model, step_save_path, f"Step {total_steps}")
+             last_step_save = total_steps # Update last saved step
+
 
     # --- End of Training ---
-    env.close()
-    print("Training finished.")
+    env.close(); logger.info("Training finished.")
 
     # --- Save Final Model ---
-    final_save_path = "pinball_dqn_final.pth"
-    try:
-        torch.save(model.state_dict(), final_save_path)
-        print(f"Final model state dictionary saved to {final_save_path}")
-    except Exception as e:
-        print(f"Error saving final model: {e}")
+    final_model_filename = "pinball_dqn_final.pth" # Simple name as it's inside timestamped folder
+    final_save_path = os.path.join(run_weights_dir, final_model_filename)
+    save_model_state(model, final_save_path, "Final")
+    # ---
+
+# if __name__ == "__main__":
+#     # Ensure config values exist or set defaults (moved some from original spot)
+#     globals().setdefault('NUM_EPISODES', 10000)
+#     globals().setdefault('LEFT_FLIPPER_COST', -0.1) # Use values from your config if different
+#     globals().setdefault('RIGHT_FLIPPER_COST', -0.1)
+#     globals().setdefault('BOTH_FLIPPERS_COST', -0.2)
+#     globals().setdefault('DOWN_COST', -0.5)
+#     globals().setdefault('NO_FLIPPER_COST', 0.0)
+#     globals().setdefault('FIRE_COST', -0.5)
+#     globals().setdefault('LIFE_LOST_PENALTY', -50) # Added default for the new penalty
+#     globals().setdefault('NUM_FRAMES_STACKED', 4)
+#     globals().setdefault('GRADIENT_CLIP_VALUE', 1.0)
+#     globals().setdefault('LEARNING_RATE', 1e-4)
+#     globals().setdefault('GAMMA', 0.99)
+#     globals().setdefault('EPSILON_START', 1.0)
+#     globals().setdefault('EPSILON_MIN', 0.1)
+#     globals().setdefault('EPSILON_DECAY', 0.999995)
+#     globals().setdefault('BATCH_SIZE', 32)
+#     globals().setdefault('MEMORY_SIZE', 100000)
+#     globals().setdefault('TARGET_UPDATE_FREQ', 1000)
+#     globals().setdefault('AGENT_ACTION_SPACE', ['NO_ACTION', 'FIRE', 'LEFT_FLIPPER', 'RIGHT_FLIPPER', 'BOTH_FLIPPERS', 'DOWN'])
+#     globals().setdefault('NUM_AGENT_ACTIONS', len(AGENT_ACTION_SPACE))
+#     globals().setdefault('ACTION_MAP', {0: 0, 1: 1, 2: 4, 3: 3, 4: 6, 5: 5})
 
 
-# main to call train if this file is run directly
-if __name__ == "__main__":
-    if 'NUM_EPISODES' not in globals():
-        print("Warning: NUM_EPISODES not found in config, using default 1000")
-        NUM_EPISODES = 1000 # Default if not in config
-    train()
+#     # Ensure base log dir exists (weights dir is handled in train())
+#     if not os.path.exists("logs"): os.makedirs("logs")
+
+#     train()
